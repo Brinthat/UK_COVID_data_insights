@@ -1,19 +1,12 @@
 # UK COVID-19 Data Explorer
 
-A web-based rebuild of an earlier Tkinter desktop COVID data visualization tool: same core
-skills (Python + MySQL + Matplotlib), now delivered as a live, shareable Streamlit app fed by
-a live public data source instead of a static historical dataset.
+
 
 **Live demo:** *(add your Streamlit Community Cloud link here once deployed)*
 
-## What changed from the original version
 
-| Original | This version |
-|---|---|
-| Tkinter desktop GUI (must download and run locally) | Streamlit web app (live public URL) |
-| Static/historical dataset | Live UKHSA data dashboard API |
-| Single-view charts | Filterable by nation and metric, 7-day rolling average |
-| No deployment | Deployed free on Streamlit Community Cloud, MySQL hosted free on Aiven |
+
+
 
 ## Data source
 
@@ -24,19 +17,16 @@ Scotland, Wales, and Northern Ireland.
 ## Tech stack
 
 - **Python** — data pipeline (`requests`, `pandas`)
-- **MySQL** — storage layer (local MySQL Community Server for development; free-forever
-  [Aiven for MySQL](https://aiven.io/free-mysql-database) for the deployed version — no credit
-  card required)
+- **MySQL** —[Aiven for MySQL](https://aiven.io/free-mysql-database) for the deployed version 
 - **SQLAlchemy + PyMySQL** — database connectivity
 - **Streamlit** — interactive web interface
-- **Matplotlib** — visualisation (kept from the original project, now embedded in a web app
-  instead of a Tkinter window)
+- **Matplotlib** — visualisation 
 
 ## Repo structure
 
 ```
 ├── fetch_and_load.py      # pulls data from UKHSA API, loads into MySQL
-├── app.py                 # Streamlit web app (was: Tkinter desktop app)
+├── app.py                 # Streamlit web app
 ├── requirements.txt
 └── README.md
 ```
@@ -44,9 +34,7 @@ Scotland, Wales, and Northern Ireland.
 ## How to run
 
 ### 1. Set up MySQL (choose one)
-- **Local (for development):** install [MySQL Community Server](https://dev.mysql.com/downloads/mysql/) (free), create a database called `covid_dashboard`
-- **Cloud (for deployment):** sign up for [Aiven for MySQL](https://aiven.io/free-mysql-database) — free forever, no credit card
-
+- **Cloud (for deployment):** sign up for [Aiven for MySQL](https://aiven.io/free-mysql-database)
 ### 2. Set your database credentials as environment variables
 ```bash
 export DB_HOST=your-host
