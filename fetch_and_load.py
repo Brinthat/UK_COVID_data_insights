@@ -24,6 +24,9 @@ import time
 import requests
 import pandas as pd
 from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
+
+load_dotenv()  # reads a local .env file if present; harmless if it doesn't exist
 
 # ---------------------------------------------------------------------------
 # MySQL connection — set these as environment variables, never hard-code
@@ -53,30 +56,33 @@ BASE_URL = "https://api.ukhsa-dashboard.data.gov.uk"
 
 NATIONS = ["England", "Scotland", "Wales", "Northern Ireland"]
 
+# National-level trends (no age/sex breakdown available for these -- confirmed
+# via discover_real_categories.py that admissions only has age='all', sex='all').
 METRICS = {
     "COVID-19_cases_casesByDay": "cases",
     "COVID-19_testing_PCRcountByDay": "tests",
+    "COVID-19_healthcare_admissionByDay": "admissions",
 }
 
 # ---------------------------------------------------------------------------
-# Demographic (age/sex) data -- healthcare (hospital admissions) and
-# vaccination uptake, filtered by age band and sex, so we can ask "who is
-# still affected?" rather than just "how many cases were there?"
+# Demographic (age/sex) data -- vaccine uptake only.
 #
-# NOTE: not every metric name below is guaranteed to exist for every
-# geography/age/sex combination -- the UKHSA API docs are explicit about
-# this. fetch_demographic_metric() skips and logs anything unavailable
-# rather than failing, so double check console output after running this
-# and adjust DEMO_METRICS / AGE_BANDS if a particular combination is empty.
+# CONFIRMED via discover_real_categories.py that admissions has NO age/sex
+# breakdown (only 'all'/'all' exists) -- so it's a national metric above, not
+# a demographic one. Vaccine uptake genuinely IS age-stratified, but only for
+# the age groups eligible for the autumn 2024 booster (65+ and related bands),
+# using real category labels with HYPHENS, not the underscore scheme used
+# elsewhere on this API -- confirmed from the live data itself.
 # ---------------------------------------------------------------------------
 DEMO_METRICS = {
-    "COVID-19_healthcare_admissionByDay": "admissions",
-    "COVID-19_vaccinations_autumn23_uptakeByDay": "vaccine_uptake",
+    "COVID-19_vaccinations_autumn24_uptakeByDay": "vaccine_uptake",
 }
 
-AGE_BANDS = [
-    "00-04", "05-14", "15-44", "45-64", "65-74", "75-84", "85+",
-]
+# Real age categories confirmed present in the vaccine uptake data.
+# "65+" is the aggregate across the other four bands -- excluded from the
+# per-band loop below to avoid double-counting, but the app can still show
+# it separately as an overall reference if useful.
+AGE_BANDS = ["65-69", "70-74", "75-79", "80+"]
 
 SEXES = ["all", "f", "m"]
 
@@ -172,7 +178,25 @@ def fetch_all() -> pd.DataFrame:
 
 def load_to_mysql(df: pd.DataFrame):
     df["date"] = pd.to_datetime(df["date"])
-    df.to_sql("covid_metrics", con=engine, if_exists="replace", index=False, chunksize=1000)
+
+    with engine.connect() as conn:
+        # Aiven's managed MySQL requires every table to have a primary key
+        # (sql_require_primary_key is enabled for replication safety), and
+        # pandas' to_sql() does not create one by default -- so the table is
+        # created explicitly here first, with an auto-increment id as the key.
+        conn.execute(text("DROP TABLE IF EXISTS covid_metrics"))
+        conn.execute(text("""
+            CREATE TABLE covid_metrics (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                geography VARCHAR(64),
+                metric VARCHAR(128),
+                date DATETIME,
+                metric_value DOUBLE
+            )
+        """))
+        conn.commit()
+
+    df.to_sql("covid_metrics", con=engine, if_exists="append", index=False, chunksize=1000)
 
     with engine.connect() as conn:
         conn.execute(text(
@@ -189,7 +213,23 @@ def load_demographics_to_mysql(df: pd.DataFrame):
         return
 
     df["date"] = pd.to_datetime(df["date"])
-    df.to_sql("covid_demographics", con=engine, if_exists="replace", index=False, chunksize=1000)
+
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS covid_demographics"))
+        conn.execute(text("""
+            CREATE TABLE covid_demographics (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                geography VARCHAR(64),
+                metric VARCHAR(128),
+                age VARCHAR(16),
+                sex VARCHAR(8),
+                date DATETIME,
+                metric_value DOUBLE
+            )
+        """))
+        conn.commit()
+
+    df.to_sql("covid_demographics", con=engine, if_exists="append", index=False, chunksize=1000)
 
     with engine.connect() as conn:
         conn.execute(text(

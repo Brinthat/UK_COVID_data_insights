@@ -7,3 +7,4 @@ sqlalchemy
 pymysql
 scikit-fuzzy
 networkx
+python-dotenv

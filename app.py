@@ -23,6 +23,9 @@ Deploy free:    push this repo to GitHub, connect it at streamlit.io/cloud,
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()  # reads a local .env file if present; harmless if it doesn't exist
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -31,9 +34,10 @@ from sqlalchemy import create_engine, text
 import skfuzzy as fuzz
 from skfuzzy import control as ctrl
 
-# Must match AGE_BANDS in fetch_and_load.py, used to keep age bands in natural order
-# on charts rather than alphabetical/insertion order.
-AGE_BAND_ORDER = ["00-04", "05-14", "15-44", "45-64", "65-74", "75-84", "85+"]
+# Must match AGE_BANDS in fetch_and_load.py -- confirmed via discover_real_categories.py
+# that these are the real age-band labels the vaccine uptake metric actually uses
+# (hyphenated, and only the groups eligible for the autumn 2024 booster).
+AGE_BAND_ORDER = ["65-69", "70-74", "75-79", "80+"]
 
 st.set_page_config(page_title="UK COVID-19 Data Explorer", layout="wide")
 
@@ -46,12 +50,19 @@ st.caption(
 # ---------------------------------------------------------------------------
 # MySQL connection -- reads from environment variables locally, or from
 # Streamlit's secrets manager when deployed (st.secrets).
+#
+# NOTE: st.secrets raises an error just from being *checked* when no
+# secrets.toml file exists at all (as is normal for local runs that use a
+# .env file / environment variables instead) -- so this must be wrapped in
+# try/except rather than a plain "in" check.
 # ---------------------------------------------------------------------------
 def get_engine():
-    if hasattr(st, "secrets") and "DB_HOST" in st.secrets:
-        cfg = st.secrets
-    else:
-        cfg = os.environ
+    cfg = os.environ
+    try:
+        if "DB_HOST" in st.secrets:
+            cfg = st.secrets
+    except Exception:
+        pass  # no secrets.toml present -- fall back to environment variables / .env
 
     host = cfg.get("DB_HOST", "localhost")
     port = cfg.get("DB_PORT", "3306")
@@ -140,14 +151,21 @@ with tab_trends:
     st.dataframe(summary, use_container_width=True)
 
 # ===========================================================================
-# TAB 2 -- Demographic Insights: who is still affected, not just how many cases
+# TAB 2 -- Demographic Insights: vaccine uptake across older age groups
+#
+# NOTE ON SCOPE: debugging against the live API confirmed that hospital
+# admissions has NO age/sex breakdown at all (only a single national daily
+# figure exists) -- so it's shown as a national trend in Tab 1 instead.
+# Vaccine uptake genuinely IS age-stratified, but only for the age groups
+# eligible for the autumn 2024 booster (65-69, 70-74, 75-79, 80+), which is
+# what this tab is built around.
 # ===========================================================================
 with tab_demographics:
-    st.subheader("Hospital admissions vs. vaccine uptake, by age band")
+    st.subheader("Vaccine uptake across older age groups")
     st.caption(
-        "Age bands where admissions are relatively high and vaccine uptake is relatively "
-        "low are the groups with the largest 'protection gap' -- the most actionable finding "
-        "from this view."
+        "The autumn 2024 booster was offered to specific eligible groups (65+ and related "
+        "bands), so this is the age-stratified data that genuinely exists -- admissions data "
+        "is only available as a single national figure, shown in the National Trends tab."
     )
 
     try:
@@ -161,122 +179,129 @@ with tab_demographics:
 
     if not demo_df.empty:
         demo_nation = st.selectbox("Nation", sorted(demo_df["geography"].unique()), key="demo_nation")
-        demo_all_sex = demo_df[(demo_df["geography"] == demo_nation) & (demo_df["sex"] == "all")]
+        demo_all_sex = demo_df[
+            (demo_df["geography"] == demo_nation)
+            & (demo_df["sex"] == "all")
+            & (demo_df["age"].isin(AGE_BAND_ORDER))  # excludes the "65+" aggregate row
+        ]
 
-        # Average each metric per age band over the full period pulled -- a simple,
-        # interpretable summary rather than a full time series, since the point here
-        # is comparing groups, not tracking trend.
         age_summary = (
-            demo_all_sex.groupby(["age", "metric"])["metric_value"]
+            demo_all_sex.groupby("age")["metric_value"]
             .mean()
-            .unstack("metric")
             .reindex(AGE_BAND_ORDER)
-            .dropna(how="all")
+            .dropna()
         )
 
-        if {"admissions", "vaccine_uptake"}.issubset(age_summary.columns):
-            fig2, ax2 = plt.subplots(figsize=(10, 5))
-            x = np.arange(len(age_summary.index))
-            width = 0.35
-            ax2.bar(x - width / 2, age_summary["admissions"], width, label="Avg. admissions", color="firebrick")
-            ax2.bar(x + width / 2, age_summary["vaccine_uptake"], width, label="Avg. vaccine uptake (%)", color="steelblue")
-            ax2.set_xticks(x)
-            ax2.set_xticklabels(age_summary.index, rotation=0)
-            ax2.set_title(f"Admissions vs. vaccine uptake by age band — {demo_nation}")
-            ax2.legend()
+        if not age_summary.empty:
+            fig2, ax2 = plt.subplots(figsize=(9, 5))
+            colors = ["seagreen" if v >= age_summary.median() else "goldenrod" for v in age_summary.values]
+            ax2.bar(age_summary.index, age_summary.values, color=colors)
+            ax2.set_ylabel("Average vaccine uptake (%)")
+            ax2.set_title(f"Autumn 2024 booster uptake by age band — {demo_nation}")
             st.pyplot(fig2)
 
-            st.dataframe(age_summary.round(2), use_container_width=True)
+            st.dataframe(age_summary.round(2).rename("Avg. uptake (%)"), use_container_width=True)
 
             # -----------------------------------------------------------------
             # Fuzzy Vulnerability Index -- adapted from a Mamdani fuzzy inference
             # approach (triangular membership functions, rule-based inference)
-            # used in prior fuzzy-logic research, applied here to combine two
-            # imprecise demographic signals into one interpretable score.
+            # used in prior fuzzy-logic research.
+            #
+            # Inputs: (1) vaccine uptake (real data, inverted -- lower uptake
+            # means higher vulnerability), and (2) age-band baseline risk, an
+            # ordinal 1-4 encoding reflecting the well-established finding that
+            # COVID risk increases with age even within older cohorts. This
+            # replaces the original admissions-based design, since admissions
+            # data has no age breakdown to combine with.
             # -----------------------------------------------------------------
             st.subheader("Fuzzy Vulnerability Index by age band")
             st.caption(
-                "A Mamdani fuzzy inference system combining admission rate and vaccine "
-                "uptake into a single 0-10 vulnerability score per age band, using "
-                "triangular membership functions and a 3x3 rule base."
+                "A Mamdani fuzzy inference system combining vaccine uptake with an "
+                "age-related baseline risk factor into a single 0-10 vulnerability score, "
+                "using triangular membership functions and a rule base."
             )
 
-            admission_max = max(age_summary["admissions"].max(), 1)
-            uptake_max = max(age_summary["vaccine_uptake"].max(), 1)
+            age_risk_map = {"65-69": 1, "70-74": 2, "75-79": 3, "80+": 4}
 
-            admission = ctrl.Antecedent(np.linspace(0, admission_max, 100), "admission")
+            uptake_max = max(age_summary.max(), 1)
             uptake = ctrl.Antecedent(np.linspace(0, uptake_max, 100), "uptake")
+            age_risk = ctrl.Antecedent(np.linspace(1, 4, 100), "age_risk")
             vulnerability = ctrl.Consequent(np.linspace(0, 10, 100), "vulnerability")
 
-            admission.automf(3, names=["low", "medium", "high"])
             uptake.automf(3, names=["low", "medium", "high"])
+            age_risk.automf(3, names=["low", "medium", "high"])
 
             vulnerability["low"] = fuzz.trimf(vulnerability.universe, [0, 0, 5])
             vulnerability["moderate"] = fuzz.trimf(vulnerability.universe, [2, 5, 8])
             vulnerability["high"] = fuzz.trimf(vulnerability.universe, [5, 10, 10])
 
             rules = [
-                ctrl.Rule(admission["high"] & uptake["low"], vulnerability["high"]),
-                ctrl.Rule(admission["high"] & uptake["medium"], vulnerability["high"]),
-                ctrl.Rule(admission["medium"] & uptake["low"], vulnerability["high"]),
-                ctrl.Rule(admission["medium"] & uptake["medium"], vulnerability["moderate"]),
-                ctrl.Rule(admission["high"] & uptake["high"], vulnerability["moderate"]),
-                ctrl.Rule(admission["low"] & uptake["low"], vulnerability["moderate"]),
-                ctrl.Rule(admission["medium"] & uptake["high"], vulnerability["low"]),
-                ctrl.Rule(admission["low"] & uptake["medium"], vulnerability["low"]),
-                ctrl.Rule(admission["low"] & uptake["high"], vulnerability["low"]),
+                ctrl.Rule(age_risk["high"] & uptake["low"], vulnerability["high"]),
+                ctrl.Rule(age_risk["high"] & uptake["medium"], vulnerability["high"]),
+                ctrl.Rule(age_risk["medium"] & uptake["low"], vulnerability["high"]),
+                ctrl.Rule(age_risk["medium"] & uptake["medium"], vulnerability["moderate"]),
+                ctrl.Rule(age_risk["high"] & uptake["high"], vulnerability["moderate"]),
+                ctrl.Rule(age_risk["low"] & uptake["low"], vulnerability["moderate"]),
+                ctrl.Rule(age_risk["medium"] & uptake["high"], vulnerability["low"]),
+                ctrl.Rule(age_risk["low"] & uptake["medium"], vulnerability["low"]),
+                ctrl.Rule(age_risk["low"] & uptake["high"], vulnerability["low"]),
             ]
 
             vulnerability_ctrl = ctrl.ControlSystem(rules)
 
             scores = {}
-            for age_band, row in age_summary.dropna(subset=["admissions", "vaccine_uptake"]).iterrows():
+            for band, uptake_val in age_summary.items():
                 sim = ctrl.ControlSystemSimulation(vulnerability_ctrl)
-                sim.input["admission"] = row["admissions"]
-                sim.input["uptake"] = row["vaccine_uptake"]
+                # Fuzzy inputs blend real data (uptake) with a domain-informed risk
+                # factor (age_risk), inverting uptake so LOW uptake drives HIGH vulnerability
+                sim.input["uptake"] = max(uptake_max - uptake_val, 0)
+                sim.input["age_risk"] = age_risk_map[band]
                 sim.compute()
-                scores[age_band] = sim.output["vulnerability"]
+                scores[band] = sim.output["vulnerability"]
 
-            if scores:
-                score_series = pd.Series(scores).reindex([a for a in AGE_BAND_ORDER if a in scores])
-                fig3, ax3 = plt.subplots(figsize=(10, 4))
-                colors = ["firebrick" if v >= 6 else "goldenrod" if v >= 3.5 else "seagreen" for v in score_series.values]
-                ax3.bar(score_series.index, score_series.values, color=colors)
-                ax3.set_ylabel("Fuzzy vulnerability score (0-10)")
-                ax3.set_title(f"Fuzzy Vulnerability Index by age band — {demo_nation}")
-                ax3.set_ylim(0, 10)
-                st.pyplot(fig3)
+            score_series = pd.Series(scores).reindex(AGE_BAND_ORDER).dropna()
+            fig3, ax3 = plt.subplots(figsize=(9, 4))
+            colors3 = ["firebrick" if v >= 6 else "goldenrod" if v >= 3.5 else "seagreen" for v in score_series.values]
+            ax3.bar(score_series.index, score_series.values, color=colors3)
+            ax3.set_ylabel("Fuzzy vulnerability score (0-10)")
+            ax3.set_title(f"Fuzzy Vulnerability Index by age band — {demo_nation}")
+            ax3.set_ylim(0, 10)
+            st.pyplot(fig3)
 
-                highest = score_series.idxmax()
-                st.info(
-                    f"Highest fuzzy vulnerability in this nation: age band **{highest}** "
-                    f"(score {score_series.max():.1f}/10) — the combination of admission rate "
-                    "and vaccine uptake makes this the group where the 'protection gap' is largest."
-                )
+            highest = score_series.idxmax()
+            st.info(
+                f"Highest fuzzy vulnerability in this nation: age band **{highest}** "
+                f"(score {score_series.max():.1f}/10) — driven by a combination of "
+                "relatively lower vaccine uptake and higher age-related baseline risk."
+            )
         else:
             st.warning(
-                "Both 'admissions' and 'vaccine_uptake' metrics are needed for this view. "
-                "Check that fetch_and_load.py successfully pulled both DEMO_METRICS."
+                "No vaccine uptake data found for this nation. Confirm fetch_and_load.py "
+                "successfully populated covid_demographics -- check console output for "
+                "'Loaded X rows into covid_demographics'."
             )
 
-        st.markdown("#### Sex-based comparison (acute outcomes)")
+        st.markdown("#### Sex-based comparison: vaccine uptake by age band")
         st.caption(
-            "Compares male vs. female rates directly for the selected metric -- global "
-            "research shows men have historically had somewhat higher rates of severe "
-            "acute outcomes, while women more often report persistent/long-term symptoms "
-            "(the latter isn't captured in this acute-outcomes dataset)."
+            "Male vs. female uptake rates for the autumn 2024 booster, by age band -- "
+            "real data, directly from the UKHSA API's sex filter."
         )
-        sex_metric = st.selectbox("Metric", sorted(demo_df["metric"].unique()), key="sex_metric")
         sex_df = demo_df[
             (demo_df["geography"] == demo_nation)
-            & (demo_df["metric"] == sex_metric)
+            & (demo_df["age"].isin(AGE_BAND_ORDER))
             & (demo_df["sex"].isin(["f", "m"]))
         ]
         if not sex_df.empty:
-            sex_summary = sex_df.groupby(["age", "sex"])["metric_value"].mean().unstack("sex").reindex(AGE_BAND_ORDER).dropna(how="all")
+            sex_summary = (
+                sex_df.groupby(["age", "sex"])["metric_value"]
+                .mean()
+                .unstack("sex")
+                .reindex(AGE_BAND_ORDER)
+                .dropna(how="all")
+            )
             st.bar_chart(sex_summary)
         else:
-            st.caption("No sex-disaggregated data available for this metric/nation combination.")
+            st.caption("No sex-disaggregated uptake data available for this nation.")
 
 st.markdown("---")
 st.caption(
