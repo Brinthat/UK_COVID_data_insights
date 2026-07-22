@@ -1,7 +1,7 @@
 # UK COVID-19 Data Explorer
 
 
-**Live demo:** *(add your Streamlit Community Cloud link here once deployed)*
+**Live demo:** https://ukcoviddatainsights-pdprzigee52pgsdf3nkeym.streamlit.app/
 
 ## Demographic Insights tab
 
