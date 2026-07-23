@@ -49,7 +49,7 @@ Scotland, Wales, and Northern Ireland.
 ## How to run
 
 ### 1. Set up MySQL (choose one)
-- **Cloud (for deployment):** sign up for [Aiven for MySQL](https://aiven.io/free-mysql-database) — free forever, no credit card
+- **Cloud (for deployment):** Aiven for MySQL
 
 ### 2. Set your database credentials as environment variables
 ```bash
